@@ -4,8 +4,32 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from model.model_lora import *
+from model.driving.model_driving import MiniMindDriving, DrivingConfig
 from trainer.train_utils import setup_seed
 warnings.filterwarnings('ignore')
+
+
+def init_driving_model(args):
+    """初始化驾驶模型"""
+    tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    config = DrivingConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        num_cameras=args.num_cameras,
+        num_history_frames=args.num_history_frames,
+        use_moe=bool(args.use_moe),
+    )
+    model = MiniMindDriving(config, vision_encoder_path="./model/vision_model/clip-vit-base-patch16")
+    moe_suffix = '_moe' if args.use_moe else ''
+    ckp = f'{args.save_dir}/{args.weight}_{args.hidden_size}.pth'
+    model.load_state_dict(torch.load(ckp, map_location=args.device), strict=False)
+    if args.lora_weight != 'None':
+        from model.model_lora import apply_lora, load_lora
+        apply_lora(model)
+        load_lora(model, f'{args.save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth')
+    print(f'MiniMind-Driving模型参数: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)')
+    return model.eval().to(args.device), tokenizer
+
 
 def init_model(args):
     # 如果args.load_from为'model'，会优先去./model路径下查找，加载自定义MiniMind模型，否则加载transformers格式模型
@@ -44,6 +68,11 @@ def main():
     parser.add_argument('--top_p', default=0.85, type=float, help="nucleus采样阈值（0-1）")
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    # 驾驶模型特有参数
+    parser.add_argument('--is_driving', action='store_true', help="使用驾驶模型模式")
+    parser.add_argument('--num_cameras', default=4, type=int, help="相机数量（驾驶模型）")
+    parser.add_argument('--num_history_frames', default=3, type=int, help="历史帧数（驾驶模型）")
+    parser.add_argument('--image_path', type=str, help="驾驶场景图像路径（JSON格式，包含多相机图像）")
     args = parser.parse_args()
     
     prompts = [
@@ -58,9 +87,37 @@ def main():
     ]
     
     conversation = []
-    model, tokenizer = init_model(args)
-    input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
-    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    if args.is_driving:
+        model, tokenizer = init_driving_model(args)
+        print("驾驶模型模式: 输入场景描述或使用 --image_path 加载图像")
+        streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
+        
+        prompt_iter = prompts if input_mode == 0 else iter(lambda: input('🚗 场景描述: '), '')
+        for prompt in prompt_iter:
+            setup_seed(2026)
+            if input_mode == 0: print(f'👶: {prompt}')
+            conversation = conversation[-args.historys:] if args.historys else []
+            conversation.append({"role": "user", "content": prompt})
+
+            templates = {"conversation": conversation, "tokenize": False, "add_generation_prompt": True}
+            inputs = tokenizer.apply_chat_template(**templates)
+            inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
+
+            print('🤖️: ', end='')
+            generated_ids = model.generate(
+                input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+                max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
+                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
+                top_p=args.top_p, temperature=args.temperature, repetition_penalty=1.0
+            )
+            response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
+            conversation.append({"role": "assistant", "content": response})
+            print('\n\n')
+    else:
+        model, tokenizer = init_model(args)
+        input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
+        streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('👶: '), '')
     for prompt in prompt_iter:
