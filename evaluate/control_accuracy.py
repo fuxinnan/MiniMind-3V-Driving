@@ -10,6 +10,7 @@
 """
 
 import numpy as np
+import math
 import torch
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -65,10 +66,12 @@ class ControlAccuracyEvaluator:
     def __init__(
         self,
         thresholds: Optional[Dict[str, float]] = None,
-        steering_unit: str = "degrees",  # "degrees" / "normalized"
+        steering_unit: str = "normalized",
+        steering_max_degrees: float = 30.0,
     ):
         self.thresholds = thresholds or self.DEFAULT_THRESHOLDS
         self.steering_unit = steering_unit
+        self.steering_max_degrees = steering_max_degrees
 
     def evaluate(
         self,
@@ -100,26 +103,26 @@ class ControlAccuracyEvaluator:
 
         # 转向角误差
         steering_errors = torch.abs(pred_steering - gt_steering)
-        if self.steering_unit == "degrees":
-            steering_errors = steering_errors * 180.0 / np.pi
+        if self.steering_unit == "normalized":
+            steering_errors = steering_errors * self.steering_max_degrees
 
         metrics.steering_mae = float(steering_errors.mean())
         metrics.steering_mse = float(steering_errors.pow(2).mean())
-        metrics.steering_rmse = float(torch.sqrt(metrics.steering_mse))
+        metrics.steering_rmse = math.sqrt(metrics.steering_mse)
         metrics.steering_max_error = float(steering_errors.max())
 
         # 油门误差
         throttle_errors = torch.abs(pred_throttle - gt_throttle)
         metrics.throttle_mae = float(throttle_errors.mean())
         metrics.throttle_mse = float(throttle_errors.pow(2).mean())
-        metrics.throttle_rmse = float(torch.sqrt(metrics.throttle_mse))
+        metrics.throttle_rmse = math.sqrt(metrics.throttle_mse)
         metrics.throttle_max_error = float(throttle_errors.max())
 
         # 刹车误差
         brake_errors = torch.abs(pred_brake - gt_brake)
         metrics.brake_mae = float(brake_errors.mean())
         metrics.brake_mse = float(brake_errors.pow(2).mean())
-        metrics.brake_rmse = float(torch.sqrt(metrics.brake_mse))
+        metrics.brake_rmse = math.sqrt(metrics.brake_mse)
         metrics.brake_max_error = float(brake_errors.max())
 
         # 综合误差
@@ -205,9 +208,9 @@ class ControlAccuracyEvaluator:
         # 超出范围
         steering = predicted_controls[:, 0]
         out_of_range = (
-            torch.abs(steering) > 1.01 |
-            throttle > 1.01 |
-            brake > 1.01
+            (torch.abs(steering) > 1.01)
+            | (throttle > 1.01)
+            | (brake > 1.01)
         )
         oor_rate = float(out_of_range.float().mean())
 

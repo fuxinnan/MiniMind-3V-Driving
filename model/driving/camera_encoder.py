@@ -89,10 +89,13 @@ class CameraEncoder(nn.Module):
             [B, num_cameras * num_patches, hidden_size]
         """
         B, NC, NP, VE_HS = visual_features.shape
-        assert NC == self.num_cameras, \
-            f"Expected {self.num_cameras} cameras, got {NC}"
-        assert NP == self.image_tokens_per_camera, \
-            f"Expected {self.image_tokens_per_camera} patches, got {NP}"
+        if not torch.jit.is_tracing():
+            if NC != self.num_cameras:
+                raise ValueError(f"Expected {self.num_cameras} cameras, got {NC}")
+            if NP != self.image_tokens_per_camera:
+                raise ValueError(
+                    f"Expected {self.image_tokens_per_camera} patches, got {NP}"
+                )
 
         # 1. 投影到 LLM 维度
         # [B, NC, NP, VE_HS] -> [B, NC, NP, HS]

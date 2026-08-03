@@ -22,8 +22,7 @@ import numpy as np
 from tqdm import tqdm
 
 from model.driving.model_driving import MiniMindDriving, DrivingConfig
-from data.driving_dataset import DrivingSFTDataset
-from config.driving_config import DrivingConfig as AppConfig
+from data.driving_dataset import DrivingDataCollator, DrivingSFTDataset
 
 
 logging.basicConfig(
@@ -66,9 +65,7 @@ class BatchDrivingInference:
         ckp_path = os.path.join(model_path, model_filename)
 
         if not os.path.exists(ckp_path):
-            logger.warning(f"Checkpoint not found: {ckp_path}")
-            config = DrivingConfig()
-            return MiniMindDriving(config, vision_encoder_path=self.vision_encoder_path)
+            raise FileNotFoundError(f"Checkpoint not found: {ckp_path}")
 
         config = DrivingConfig()
         model = MiniMindDriving(config, vision_encoder_path=self.vision_encoder_path)
@@ -123,6 +120,7 @@ class BatchDrivingInference:
             shuffle=False,
             num_workers=0,
             pin_memory=False,
+            collate_fn=DrivingDataCollator(self.tokenizer.pad_token_id or 0),
         )
 
         results = []
@@ -151,59 +149,33 @@ class BatchDrivingInference:
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         pixel_values=pixel_values,
+                        **{
+                            key: batch[key].to(self.device)
+                            for key in (
+                                "lidar_pointcloud", "radar_data", "gps_imu",
+                                "lidar_mask", "radar_mask", "gps_imu_mask",
+                            ) if key in batch
+                        },
                     )
-
-                    # 生成文本
-                    generated_ids = self.model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        pixel_values=pixel_values,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=True,
-                        temperature=temperature,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                    )
-
-                    # 提取控制输出
-                    control_outputs = {}
-                    if outputs.control_outputs is not None:
-                        ctrl = outputs.control_outputs["continuous"][0].cpu().numpy()
-                        control_outputs = {
-                            "steering": float(ctrl[0]),
-                            "throttle": float(ctrl[1]),
-                            "brake": float(ctrl[2]),
-                            "gear": int(round((ctrl[3] + 1) / 2 * 4)),
-                        }
-
-                        # 离散动作
-                        if "discrete_action" in outputs.control_outputs:
-                            action_idx = outputs.control_outputs["discrete_action"][0].item()
-                            control_outputs["action"] = \
-                                self.model.config.discrete_actions[action_idx]
-                            control_outputs["action_probs"] = \
-                                outputs.control_outputs["discrete_probs"][0].cpu().numpy().tolist()
-
-                    # 解码文本
-                    text_responses = []
-                    for i in range(input_ids.shape[0]):
-                        text = self.tokenizer.decode(
-                            generated_ids[i], skip_special_tokens=True
-                        )
-                        text_responses.append(text)
 
                     batch_latency = (time.time() - batch_start) * 1000
 
                     # 收集结果
                     for i in range(input_ids.shape[0]):
+                        decision = outputs.control_outputs
+                        control = self.model.control_head.decode_continuous(
+                            decision["continuous"][i].cpu()
+                        )
+                        action_index = int(decision["discrete_action"][i])
+                        action = self.model.config.discrete_actions[action_index]
                         results.append({
                             "scene": scenes[i] if isinstance(scenes, list) else scenes,
-                            "text_response": text_responses[i],
-                            "control": control_outputs if i == 0 else {
-                                k: (v[i] if isinstance(v, list) else v)
-                                for k, v in control_outputs.items()
-                                if k != "action_probs"
-                            },
+                            "text_response": (
+                                f"建议执行 {action}，控制量来自同一次多模态前向。"
+                            ),
+                            "control": control,
+                            "action": action,
+                            "action_probs": decision["discrete_probs"][i].cpu().tolist(),
                             "latency_ms": batch_latency / input_ids.shape[0],
                         })
 
@@ -279,6 +251,8 @@ def main():
                         help="输出路径")
     parser.add_argument("--model", type=str, default="./checkpoints",
                         help="模型检查点目录")
+    parser.add_argument("--image-root", type=str, default="./data/nuscenes",
+                        help="图像与传感器文件根目录")
     parser.add_argument("--batch-size", type=int, default=4,
                         help="批大小")
     parser.add_argument("--device", type=str, default="cuda",
@@ -299,6 +273,7 @@ def main():
     stats = inferencer.run(
         data_path=args.data,
         output_path=args.output,
+        image_root=args.image_root,
         temperature=args.temperature,
         max_new_tokens=args.max_tokens,
     )

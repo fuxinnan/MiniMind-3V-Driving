@@ -43,6 +43,7 @@ class DrivingEvaluationResult:
     # 文本生成质量
     text_bleu: float = 0.0
     text_rouge: float = 0.0
+    text_token_accuracy: float = 0.0
 
     # 综合评分
     overall_score: float = 0.0
@@ -111,6 +112,8 @@ class DrivingEvaluator:
         all_speeds = []
         all_text_responses = []
         all_text_targets = []
+        text_correct = 0
+        text_total = 0
 
         with torch.no_grad():
             for batch in dataloader:
@@ -124,12 +127,28 @@ class DrivingEvaluator:
                 metadata = batch.get("metadata", {})
 
                 # 前向传播
+                model_inputs = {
+                    key: batch[key].to(self.device)
+                    for key in (
+                        "lidar_pointcloud", "radar_data", "gps_imu",
+                        "lidar_mask", "radar_mask", "gps_imu_mask",
+                    ) if key in batch
+                }
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     pixel_values=pixel_values,
-                    control_labels=gt_controls,
+                    **model_inputs,
                 )
+                if outputs.logits.shape[1] > 1:
+                    predicted_tokens = outputs.logits[:, :-1].argmax(dim=-1)
+                    target_tokens = input_ids[:, 1:]
+                    valid_tokens = attention_mask[:, 1:].bool()
+                    text_correct += int(
+                        (predicted_tokens[valid_tokens] == target_tokens[valid_tokens])
+                        .sum().item()
+                    )
+                    text_total += int(valid_tokens.sum().item())
 
                 # 提取预测控制
                 if outputs.control_outputs is not None:
@@ -137,6 +156,11 @@ class DrivingEvaluator:
                     all_predicted_controls.append(pred_controls.cpu())
 
                     if gt_controls is not None:
+                        control_mask = batch.get("control_label_mask")
+                        if control_mask is not None:
+                            pred_controls = pred_controls[control_mask.bool()]
+                            all_predicted_controls[-1] = pred_controls.cpu()
+                            gt_controls = gt_controls[control_mask.bool()]
                         gt_ctrl = gt_controls.to(self.device)
                         if gt_ctrl.dim() == 0:
                             gt_ctrl = gt_ctrl.unsqueeze(0)
@@ -148,6 +172,11 @@ class DrivingEvaluator:
                     all_predicted_actions.append(pred_actions.cpu())
 
                     if gt_actions is not None:
+                        action_mask = batch.get("action_label_mask")
+                        if action_mask is not None:
+                            pred_actions = pred_actions[action_mask.bool()]
+                            all_predicted_actions[-1] = pred_actions.cpu()
+                            gt_actions = gt_actions[action_mask.bool()]
                         all_ground_truth_actions.append(gt_actions.cpu())
 
                 # 收集场景标签
@@ -155,25 +184,16 @@ class DrivingEvaluator:
                     all_scenes.extend(scenes)
 
                 # 收集速度
-                if "speed" in metadata:
-                    speeds_list = metadata["speed"]
-                    if isinstance(speeds_list, list):
-                        all_speeds.extend([float(s) for s in speeds_list])
-                    else:
-                        all_speeds.append(float(speeds_list))
-
-                # 生成文本响应
-                if tokenizer:
-                    generated = model.generate_driving_decision(
-                        pixel_values=pixel_values,
-                        prompt_text="分析当前驾驶场景",
-                        tokenizer=tokenizer,
-                        max_new_tokens=64,
-                    )
-                    all_text_responses.append(generated.get("text_response", ""))
+                if isinstance(metadata, list):
+                    for item in metadata:
+                        ego = item.get("ego_state") or {}
+                        all_speeds.append(float(ego.get("speed_kmh", 0.0)))
 
                 result.total_samples += input_ids.shape[0]
                 result.valid_samples += input_ids.shape[0]
+        result.text_token_accuracy = (
+            text_correct / text_total if text_total else 0.0
+        )
 
         # 计算控制精度
         if all_predicted_controls and all_ground_truth_controls:
@@ -301,6 +321,7 @@ class DrivingEvaluator:
             "action_precision": result.action_precision,
             "action_recall": result.action_recall,
             "action_f1": result.action_f1,
+            "text_token_accuracy": result.text_token_accuracy,
         }
 
         if result.control_metrics:

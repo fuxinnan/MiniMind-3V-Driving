@@ -27,6 +27,7 @@ def prepare_nuscenes_data(
     split_ratios: Dict[str, float] = None,
     num_frames: int = 3,
     camera_names: List[str] = None,
+    version: Optional[str] = None,
 ):
     """
     从 nuScenes 数据集准备训练数据
@@ -38,84 +39,40 @@ def prepare_nuscenes_data(
         num_frames: 每场景使用的帧数
         camera_names: 使用的相机列表
     """
+    from data.nuscenes_adapter import NuScenesAdapter
     split_ratios = split_ratios or {"train": 0.8, "val": 0.1, "test": 0.1}
-    camera_names = camera_names or ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT", "CAM_BACK"]
-
-    print(f"Preparing nuScenes data from {nuscenes_root}")
-    print(f"Output dir: {output_dir}")
-    print(f"Cameras: {camera_names}")
-
-    # 加载 nuScenes annotation
-    from nuscenes.nuscenes import NuScenes
-    nusc = NuScenes(version="v1.0-trainval", dataroot=nuscenes_root)
-
-    # 场景分类映射
-    scene_category_map = {
-        "scene.name": "scene",
+    adapter = NuScenesAdapter(
+        nuscenes_root, version=version, num_frames=num_frames
+    )
+    records = adapter.records()
+    # Split by scene, not individual frames, to prevent temporal leakage.
+    scene_tokens = sorted({
+        item["metadata"]["scene_token"] for item in records
+    })
+    rng = np.random.default_rng(42)
+    rng.shuffle(scene_tokens)
+    train_end = int(len(scene_tokens) * split_ratios["train"])
+    val_end = train_end + int(len(scene_tokens) * split_ratios["val"])
+    scene_split = {
+        token: (
+            "train" if index < train_end
+            else "val" if index < val_end else "test"
+        )
+        for index, token in enumerate(scene_tokens)
     }
-
-    train_data = []
-    val_data = []
-    test_data = []
-
-    for i, sample in enumerate(tqdm(nusc.sample, desc="Processing samples")):
-        # 获取场景信息
-        scene_token = sample["scene_token"]
-        scene = nusc.get("scene", scene_token)
-        scene_name = scene["name"]
-
-        # 场景分类
-        scene_type = classify_nuscenes_scene(scene_name)
-
-        # 获取该场景的所有帧
-        log_token = scene["log_token"]
-        camera_tokens = [
-            nusc.get("token2log", sample["token"]) for sample in nusc.sample
-        ]
-
-        # 简化: 只取部分帧作为示例
-        # 实际实现需要更复杂的帧选择和关联
-
-        if i < len(nusc.sample) * split_ratios["train"]:
-            train_data.append({
-                "scene": scene_type,
-                "prompt": f"高速公路场景，车速60km/h",
-                "response": "保持当前车道行驶",
-                "controls": {"steering": 0.0, "throttle": 0.3, "brake": 0.0, "gear": 2},
-                "action": "keep_lane",
-                "weather": "sunny",
-            })
-        elif i < len(nusc.sample) * (split_ratios["train"] + split_ratios["val"]):
-            val_data.append({
-                "scene": scene_type,
-                "prompt": f"城市道路场景",
-                "response": "减速准备转弯",
-                "controls": {"steering": 0.1, "throttle": 0.1, "brake": 0.2, "gear": 2},
-                "action": "turn_right",
-                "weather": "cloudy",
-            })
-        else:
-            test_data.append({
-                "scene": scene_type,
-                "prompt": f"十字路口场景",
-                "response": "停车让行",
-                "controls": {"steering": 0.0, "throttle": 0.0, "brake": 0.8, "gear": 2},
-                "action": "stop",
-                "weather": "rainy",
-            })
-
-    # 保存数据
+    split_data = {"train": [], "val": [], "test": []}
+    for item in records:
+        split_data[scene_split[item["metadata"]["scene_token"]]].append(item)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-
-    for split, data in [("train", train_data), ("val", val_data), ("test", test_data)]:
+    for split, data in split_data.items():
         split_path = output_path / f"{split}.jsonl"
         with open(split_path, "w", encoding="utf-8") as f:
             for item in data:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"  {split}: {len(data)} samples -> {split_path}")
 
-    print(f"Preparation complete!")
+    print(f"nuScenes conversion complete ({adapter.version})")
 
 
 def classify_nuscenes_scene(scene_name: str) -> str:
@@ -240,6 +197,17 @@ def generate_synthetic_data(
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    image_root = output_path / "synthetic_images"
+    camera_names = ["front", "left", "right", "rear"]
+    from PIL import Image, ImageDraw
+    for camera_index, camera in enumerate(camera_names):
+        camera_dir = image_root / camera
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        for frame in range(3):
+            image_path = camera_dir / f"frame_{frame}.jpg"
+            image = Image.new("RGB", (224, 224), (30 + 20 * camera_index, 40, 60))
+            ImageDraw.Draw(image).text((8, 8), f"{camera} t-{2-frame}", fill="white")
+            image.save(image_path)
 
     data = []
     for i in tqdm(range(n_samples), desc="Generating"):
@@ -262,10 +230,26 @@ def generate_synthetic_data(
         response = generate_response(action, controls, scene)
 
         data.append({
+            "schema_version": "1.0",
             "scene": scene,
             "prompt": prompt,
             "response": response,
             "controls": controls,
+            "images": {
+                camera: [
+                    str(Path("synthetic_images") / camera / f"frame_{frame}.jpg")
+                    for frame in range(3)
+                ]
+                for camera in camera_names
+            },
+            "calibration": {
+                camera: {"camera_intrinsic": [], "translation": [0, 0, 0],
+                         "rotation": [1, 0, 0, 0]}
+                for camera in camera_names
+            },
+            "ego_state": {"speed_kmh": float(np.random.uniform(0, 120))},
+            "sensors": {"lidar": [], "radar": {}, "gps_imu": None},
+            "label_source": "synthetic",
             "action": action,
             "weather": np.random.choice(weather_options),
             "time_of_day": np.random.choice(time_options),
@@ -273,13 +257,14 @@ def generate_synthetic_data(
             "timestamp": int(datetime.now().timestamp()),
         })
 
-    # 保存
-    for split_name, split_ratio in [("train", 0.8), ("val", 0.1), ("test", 0.1)]:
-        n = int(n_samples * split_ratio)
-        split_data = data[:n] if split_name == "train" else (
-            data[n:n + int(n_samples * 0.1)] if split_name == "val" else data[n + int(n_samples * 0.1):]
-        )
-
+    # 保存为互不重叠的确定性切分。
+    train_end = int(n_samples * 0.8)
+    val_end = train_end + int(n_samples * 0.1)
+    for split_name, split_data in (
+        ("train", data[:train_end]),
+        ("val", data[train_end:val_end]),
+        ("test", data[val_end:]),
+    ):
         split_path = output_path / f"{split_name}.jsonl"
         with open(split_path, "w", encoding="utf-8") as f:
             for item in split_data:
@@ -360,13 +345,17 @@ def main():
                         help="合成数据样本数")
     parser.add_argument("--nuscenes_root", type=str, default="./data/nuscenes",
                         help="nuScenes 数据目录")
+    parser.add_argument("--nuscenes_version", type=str, default=None,
+                        help="例如 v1.0-mini；默认根据目录自动检测")
 
     args = parser.parse_args()
 
     if args.source == "synthetic":
         generate_synthetic_data(args.output, n_samples=args.n_samples)
     elif args.source == "nuscenes":
-        prepare_nuscenes_data(args.nuscenes_root, args.output)
+        prepare_nuscenes_data(
+            args.nuscenes_root, args.output, version=args.nuscenes_version
+        )
     elif args.source == "custom":
         prepare_custom_data(args.output, args.output)
 

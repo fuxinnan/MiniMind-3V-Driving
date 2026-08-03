@@ -17,9 +17,8 @@ import torch
 import numpy as np
 
 from model.driving.model_driving import MiniMindDriving, DrivingConfig
-from data.driving_dataset import DrivingSFTDataset
+from data.driving_dataset import DrivingDataCollator, DrivingSFTDataset
 from evaluate.driving_evaluator import DrivingEvaluator
-from config.driving_config import DrivingConfig as AppConfig
 
 
 logging.basicConfig(
@@ -66,6 +65,8 @@ def evaluate_model(
         # 尝试直接路径
         ckp_path = model_path
 
+    if not os.path.isfile(ckp_path):
+        raise FileNotFoundError(f"Driving checkpoint not found: {ckp_path}")
     weights = torch.load(ckp_path, map_location=device)
     if isinstance(weights, dict) and "model" in weights:
         model.load_state_dict(weights["model"], strict=False)
@@ -99,6 +100,7 @@ def evaluate_model(
         shuffle=False,
         num_workers=0,
         pin_memory=False,
+        collate_fn=DrivingDataCollator(tokenizer.pad_token_id or 0),
     )
 
     logger.info(f"Evaluating on {len(dataset)} samples")

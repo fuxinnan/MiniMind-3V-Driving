@@ -1,4 +1,15 @@
 from .base_config import BaseConfig
-from .driving_config import DrivingConfig, SENSOR_CONFIG, CONTROL_CONFIG, TRAINING_CONFIG, SCENE_CONFIG, EVALUATION_CONFIG
-from .sensor_config import SENSOR_CONFIG as SENSOR_CONFIG_DETAIL
+from .driving_config import (
+    ACTION_TO_ID,
+    CAMERA_NAMES,
+    CONTINUOUS_CONTROL_KEYS,
+    CONTROL_CONFIG,
+    DISCRETE_ACTIONS,
+    EVALUATION_CONFIG,
+    SCENE_CONFIG,
+    SENSOR_CONFIG,
+    TRAINING_CONFIG,
+    DrivingConfig,
+)
+from .sensor_config import SensorConfig
 from .lora_config import LoRAConfig

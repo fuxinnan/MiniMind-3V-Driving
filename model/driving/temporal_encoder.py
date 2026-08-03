@@ -85,8 +85,10 @@ class TemporalEncoder(nn.Module):
             mode="enhance":   [B, num_cameras, num_frames, num_patches, hidden_size]
         """
         B, NC, NF, NP, HS = camera_features.shape
-        assert NF == self.num_history_frames, \
-            f"Expected {self.num_history_frames} frames, got {NF}"
+        if not torch.jit.is_tracing() and NF != self.num_history_frames:
+            raise ValueError(
+                f"Expected {self.num_history_frames} frames, got {NF}"
+            )
 
         if self.mode == "aggregate":
             return self._aggregate(camera_features)

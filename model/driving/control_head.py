@@ -55,7 +55,8 @@ class ControlHead(nn.Module):
         )
 
         # 连续控制头
-        self.continuous_proj = nn.Linear(control_hidden_size // 2, continuous_dims)
+        self.continuous_proj = nn.Linear(control_hidden_size // 2, 3)
+        self.gear_proj = nn.Linear(control_hidden_size // 2, 5)
         # 离散控制头
         if self.num_discrete > 0:
             self.discrete_proj = nn.Linear(control_hidden_size // 2, self.num_discrete)
@@ -75,6 +76,7 @@ class ControlHead(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         nn.init.xavier_uniform_(self.continuous_proj.weight)
+        nn.init.xavier_uniform_(self.gear_proj.weight)
         if self.num_discrete > 0:
             nn.init.xavier_uniform_(self.discrete_proj.weight)
 
@@ -98,14 +100,17 @@ class ControlHead(nn.Module):
         shared = self.shared_mlp(hidden_state)  # [B, control_hidden_size//2]
 
         # 连续控制输出
-        continuous = self.continuous_proj(shared)  # [B, 4]
-        # 对 steering 使用 Tanh (范围 [-1, 1])
-        # 对 throttle/brake/gear 使用 Sigmoid (范围 [0, 1])
-        # 这里统一用 Tanh，推理时根据范围转换
-        continuous = torch.tanh(continuous)
+        raw_continuous = self.continuous_proj(shared)
+        steering = torch.tanh(raw_continuous[:, :1])
+        pedals = torch.sigmoid(raw_continuous[:, 1:3])
+        gear_logits = self.gear_proj(shared)
+        gear = gear_logits.argmax(dim=-1, keepdim=True).to(steering.dtype)
+        continuous = torch.cat([steering, pedals, gear], dim=-1)
 
         result = {
             "continuous": continuous,
+            "continuous_regression": torch.cat([steering, pedals], dim=-1),
+            "gear_logits": gear_logits,
         }
 
         # 离散控制输出
@@ -146,14 +151,11 @@ class ControlHead(nn.Module):
         if brake_range is None:
             brake_range = self.brake_range
 
-        # 反归一化
-        steering = continuous_normalized[0] * (steering_range[1] - steering_range[0]) / 2 + \
-                   (steering_range[1] + steering_range[0]) / 2
-        throttle = continuous_normalized[1] * (throttle_range[1] - throttle_range[0]) / 2 + \
-                   (throttle_range[1] + throttle_range[0]) / 2
-        brake = continuous_normalized[2] * (brake_range[1] - brake_range[0]) / 2 + \
-                (brake_range[1] + brake_range[0]) / 2
-        gear = int(round((continuous_normalized[3] + 1) / 2 * 4))  # [-1, 1] -> [0, 4]
+        # The head now emits physical normalized controls directly.
+        steering = continuous_normalized[0].clamp(*steering_range)
+        throttle = continuous_normalized[1].clamp(*throttle_range)
+        brake = continuous_normalized[2].clamp(*brake_range)
+        gear = int(round(float(continuous_normalized[3])))
         gear = max(0, min(4, gear))
 
         return {

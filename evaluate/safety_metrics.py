@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+from collections import defaultdict
 
 
 @dataclass
@@ -48,6 +49,7 @@ class SafetyMetrics:
     # 总体安全评分
     overall_safety_score: float = 0.0       # 综合安全评分 (0-100)
     sample_count: int = 0
+    available_metrics: List[str] = field(default_factory=list)
 
 
 class SafetyEvaluator:
@@ -99,6 +101,7 @@ class SafetyEvaluator:
         # 1. 碰撞率评估
         if trajectories is not None:
             self._evaluate_collision_safety(trajectories, speeds, metrics)
+            metrics.available_metrics.extend(["collision", "lane_deviation"])
 
         # 2. 车道偏离评估
         if trajectories is not None:
@@ -106,13 +109,16 @@ class SafetyEvaluator:
 
         # 3. 交通规则评估
         self._evaluate_traffic_rules(predicted_controls, speeds, metrics)
+        metrics.available_metrics.append("control_consistency")
 
         # 4. 舒适性评估
         if speeds is not None:
             self._evaluate_comfort(speeds, predicted_controls, metrics)
+            metrics.available_metrics.append("comfort")
 
         # 5. 制动评估
         self._evaluate_braking(predicted_controls, metrics)
+        metrics.available_metrics.append("braking")
 
         # 6. 综合安全评分
         metrics.overall_safety_score = self._compute_overall_score(metrics)
@@ -266,29 +272,26 @@ class SafetyEvaluator:
             - 舒适性: 20%
         """
         # 碰撞安全评分
-        collision_score = max(0, 100 * (1 - metrics.collision_rate * 10))
-        near_miss_penalty = metrics.near_miss_rate * 20
-        collision_score = max(0, collision_score - near_miss_penalty)
-
-        # 车道偏离评分
-        deviation_score = max(0, 100 * (1 - metrics.deviation_rate))
-
-        # 规则遵守评分
+        scores = []
+        weights = []
+        if "collision" in metrics.available_metrics:
+            collision_score = max(0, 100 * (1 - metrics.collision_rate * 10))
+            collision_score = max(
+                0, collision_score - metrics.near_miss_rate * 20
+            )
+            scores.extend([
+                collision_score,
+                max(0, 100 * (1 - metrics.deviation_rate)),
+            ])
+            weights.extend([0.4, 0.2])
         violation_penalty = min(50, metrics.traffic_violation_count * 5)
         rule_score = max(0, 100 - violation_penalty)
-
-        # 舒适性评分
-        comfort_score = metrics.comfort_score
-
-        # 加权综合
-        overall = (
-            collision_score * 0.40 +
-            deviation_score * 0.20 +
-            rule_score * 0.20 +
-            comfort_score * 0.20
-        )
-
-        return float(np.clip(overall, 0, 100))
+        scores.append(rule_score)
+        weights.append(0.2)
+        if "comfort" in metrics.available_metrics:
+            scores.append(metrics.comfort_score)
+            weights.append(0.2)
+        return float(np.average(scores, weights=weights)) if scores else 0.0
 
     def evaluate_per_scene(
         self,

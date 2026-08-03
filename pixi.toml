@@ -2,7 +2,7 @@
 authors = ["tomato_hpc <awellfrog@163.com>"]
 channels = ["conda-forge"]
 name = "minimind"
-platforms = ["linux-64"]
+platforms = ["linux-64", "win-64"]
 version = "0.1.0"
 
 [tasks]
@@ -10,22 +10,25 @@ version = "0.1.0"
 check-gpu = "python -c \"import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'PyTorch version: {torch.__version__}'); print(f'CUDA version: {torch.version.cuda if torch.cuda.is_available() else None}')\""
 
 # 视觉编码器 (CLIP ViT-B/16)
-install-clip-vit = "python -c \"from transformers import CLIPModel; CLIPModel.from_pretrained('openai/clip-vit-base-patch16', local_dir='./model/vision_model/clip-vit-base-patch16')\""
+install-clip-vit = "python -c \"from transformers import CLIPModel,CLIPProcessor; p='./model/vision_model/clip-vit-base-patch16'; CLIPModel.from_pretrained('openai/clip-vit-base-patch16').save_pretrained(p); CLIPProcessor.from_pretrained('openai/clip-vit-base-patch16').save_pretrained(p)\""
 
 # 准备驾驶数据
 prepare-driving-data = "python scripts/prepare_driving_data.py --source synthetic --output ./dataset/driving/processed --n_samples 1000"
+prepare-nuscenes-mini = "python scripts/prepare_driving_data.py --source nuscenes --nuscenes_root ./data/nuscenes --nuscenes_version v1.0-mini --output ./dataset/driving/processed"
 
 # 驾驶模型 SFT 训练
-train-driving-sft = "python trainer/train_driving_sft.py --data_path ./dataset/driving/processed/train.jsonl --epochs 3 --batch_size 4 --learning_rate 1e-6 --max_seq_len 2048 --num_cameras 4 --num_history_frames 3 --accumulation_steps 4 --freeze_vision --use_augmentation"
+train-driving-sft = "python trainer/train_driving_sft.py --data_path ./dataset/driving/processed/train.jsonl --val_data_path ./dataset/driving/processed/val.jsonl --images_path ./data/nuscenes --epochs 3 --batch_size 4 --learning_rate 1e-6 --max_seq_len 2048 --num_cameras 4 --num_history_frames 3 --accumulation_steps 4 --freeze_vision --use_augmentation"
+train-driving-smoke = "python scripts/prepare_driving_data.py --source synthetic --output ./.tmp_driving_smoke --n_samples 4 && python trainer/train_driving_sft.py --data_path ./.tmp_driving_smoke/train.jsonl --images_path ./.tmp_driving_smoke --save_dir ./.tmp_driving_smoke/checkpoints --epochs 1 --batch_size 1 --num_workers 0 --max_seq_len 32 --hidden_size 32 --num_hidden_layers 1 --accumulation_steps 1 --allow-random-vision --device cpu --save_interval 999999"
 
 # 驾驶模型评估
-eval-driving = "python scripts/evaluate_driving.py --data ./dataset/driving/processed/test.jsonl --model ./checkpoints"
+eval-driving = "python scripts/evaluate_driving.py --data ./dataset/driving/processed/test.jsonl --image-root ./data/nuscenes --model ./checkpoints"
 
 # 批量推理
-batch-infer = "python serve/batch_driving_infer.py --data ./dataset/driving/processed/test.jsonl --output ./out/driving_inference --batch_size 4"
+batch-infer = "python serve/batch_driving_infer.py --data ./dataset/driving/processed/test.jsonl --image-root ./data/nuscenes --output ./out/driving_inference --batch-size 4"
 
 # API 服务
-serve-api = "python -m serve.driving_api_server --host 0.0.0.0 --port 8080"
+serve-api = "python -m serve.driving_api_server --host 0.0.0.0 --port 8080 --model-path ./checkpoints/driving_sft_512.pth"
+test-driving = "python -m pytest tests -q"
 
 # 模型部署
 deploy-export = "python scripts/deploy_driving.py --action export"
@@ -33,7 +36,8 @@ deploy-benchmark = "python scripts/deploy_driving.py --action benchmark"
 deploy-docker = "python scripts/deploy_driving.py --action docker"
 
 # 数据校验
-validate-data = "python -c \"from data.data_validator import DataValidator; v = DataValidator(); print(v.get_data_summary('./dataset/driving/processed/train.jsonl'))\""
+validate-data = "python -c \"from data.data_validator import DataValidator; v = DataValidator(); print(v.get_data_summary('./dataset/driving/processed/train.jsonl', './data/nuscenes'))\""
+validate-synthetic-data = "python -c \"from data.data_validator import DataValidator; v = DataValidator(); print(v.get_data_summary('./dataset/driving/processed/train.jsonl', './dataset/driving/processed'))\""
 
 # 场景覆盖分析
 scene-coverage = "python -c \"from evaluate.scene_coverage import SceneCoverageAnalyzer; a = SceneCoverageAnalyzer(); import json; data = [json.loads(l)['scene'] for l in open('./dataset/driving/processed/train.jsonl')]; print(a.generate_report(a.analyze(data)))\""
@@ -81,6 +85,12 @@ wandb = "==0.18.3"
 streamlit = "==1.50.0"
 einops = "==0.8.1"
 swanlab = "==0.6.8"
+nuscenes-devkit = ">=1.1.11"
+pillow = ">=10"
+scipy = ">=1.11"
+pytest = ">=8"
+onnx = ">=1.16"
+onnxruntime = ">=1.18"
 
 [pypi-options]
 # 使用清华源 (推荐，稳定)

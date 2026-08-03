@@ -25,70 +25,13 @@ from typing import Optional, Tuple, List, Dict, Union
 from transformers import CLIPModel, CLIPProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from model.model_minimind import MiniMindForCausalLM, MiniMindConfig, RMSNorm
-from model.model_vlm import VLMConfig
+from model.model_minimind import MiniMindForCausalLM
+from config.driving_config import DrivingConfig
 
 from .camera_encoder import CameraEncoder
 from .temporal_encoder import TemporalEncoder
 from .sensor_fusion_module import SensorFusionModule
 from .control_head import ControlHead
-
-
-class DrivingConfig(VLMConfig):
-    """
-    自动驾驶模型配置
-    继承 VLMConfig，扩展多相机、时序、传感器融合、控制输出
-    """
-    model_type = "driving"
-
-    def __init__(
-        self,
-        # === 多相机配置 ===
-        num_cameras: int = 4,
-        camera_names: Optional[List[str]] = None,
-        image_tokens_per_camera: int = 196,
-        total_image_tokens: Optional[int] = None,
-
-        # === 时序配置 ===
-        num_history_frames: int = 3,
-        frame_skip: int = 1,
-
-        # === 传感器融合配置 ===
-        enable_lidar: bool = False,
-        enable_radar: bool = False,
-        enable_gps_imu: bool = False,
-        sensor_fusion_method: str = "concat",
-        lidar_hidden_size: int = 512,
-        radar_hidden_size: int = 64,
-        gps_imu_dims: int = 6,
-
-        # === 控制输出配置 ===
-        control_type: str = "both",
-        continuous_dims: int = 4,
-        discrete_actions: Optional[List[str]] = None,
-        control_hidden_size: int = 256,
-
-        # === 训练策略 ===
-        freeze_vision_encoder: bool = True,
-        freeze_first_layers: int = 0,
-
-        # === 视觉编码器 ===
-        vision_encoder_path: str = "./model/vision_model/clip-vit-base-patch16",
-
-        **kwargs,
-    ):
-        self.camera_names = camera_names or ["front", "left", "right", "rear"]
-        self.total_image_tokens = total_image_tokens or (num_cameras * image_tokens_per_camera)
-        self.discrete_actions = discrete_actions or [
-            "keep_lane", "turn_left", "turn_right",
-            "stop", "accelerate", "decelerate",
-            "yield", "overtake", "park",
-            "emergency_brake", "follow_lane", "change_lane_left", "change_lane_right",
-        ]
-        super().__init__(
-            image_special_token='@' * image_tokens_per_camera,
-            **kwargs,
-        )
 
 
 class MiniMindDriving(MiniMindForCausalLM):
@@ -120,6 +63,7 @@ class MiniMindDriving(MiniMindForCausalLM):
 
         # 3. 视觉编码器 (CLIP)
         self.vision_encoder, self.processor = self._load_vision_encoder(config.vision_encoder_path)
+        self.fallback_patch_projection = nn.Linear(3, 768)
 
         # 4. 多相机编码器
         self.camera_encoder = CameraEncoder(
@@ -148,6 +92,8 @@ class MiniMindDriving(MiniMindForCausalLM):
             lidar_hidden_size=config.lidar_hidden_size,
             radar_hidden_size=config.radar_hidden_size,
             gps_imu_dims=config.gps_imu_dims,
+            lidar_point_dims=config.lidar_point_dims,
+            radar_point_dims=config.radar_point_dims,
         )
 
         # 7. 控制输出头
@@ -180,8 +126,9 @@ class MiniMindDriving(MiniMindForCausalLM):
 
     def _freeze_vision_encoder(self):
         """冻结视觉编码器"""
-        for param in self.camera_encoder.parameters():
-            param.requires_grad = False
+        if self.vision_encoder is not None:
+            for param in self.vision_encoder.parameters():
+                param.requires_grad = False
 
     def _freeze_first_layers(self, num_layers: int):
         """冻结前 N 层 LLM"""
@@ -207,10 +154,20 @@ class MiniMindDriving(MiniMindForCausalLM):
         # 展平相机和帧维度: [B*NC*NF, C, H, W]
         flat_pixel = pixel_values.view(B * NC * NF, C, H, W)
 
-        # CLIP 编码
-        with torch.no_grad():
-            clip_outputs = self.vision_encoder.vision_model(pixel_values=flat_pixel)
-        visual_features = clip_outputs.last_hidden_state[:, 1:, :]  # 去掉 [CLS], [B*NC*NF, NP, 768]
+        # CLIP 编码；无本地权重时使用可训练的轻量 patch fallback，
+        # 仅供 smoke test，生产训练必须加载真实 CLIP checkpoint。
+        if self.vision_encoder is not None:
+            grad_enabled = not self.config.freeze_vision_encoder
+            with torch.set_grad_enabled(grad_enabled):
+                clip_outputs = self.vision_encoder.vision_model(
+                    pixel_values=flat_pixel
+                )
+            visual_features = clip_outputs.last_hidden_state[:, 1:, :]
+        else:
+            grid_size = int(self.config.image_tokens_per_camera ** 0.5)
+            pooled = F.adaptive_avg_pool2d(flat_pixel, (grid_size, grid_size))
+            visual_features = pooled.flatten(2).transpose(1, 2)
+            visual_features = self.fallback_patch_projection(visual_features)
 
         NP = visual_features.shape[1]
         ve_hs = visual_features.shape[2]
@@ -218,8 +175,9 @@ class MiniMindDriving(MiniMindForCausalLM):
         # 重组为相机结构: [B, NC, NF, NP, ve_hs]
         visual_features = visual_features.view(B, NC, NF, NP, ve_hs)
 
-        # CameraEncoder: 投影 + 空间位置编码
-        camera_features = self.camera_encoder(visual_features)
+        # 先在每个相机/patch 内聚合时间，再做多相机投影。
+        temporal_features = self.temporal_encoder(visual_features)
+        camera_features = self.camera_encoder(temporal_features)
         # camera_features: [B, NC*NP, HS]
 
         return camera_features
@@ -249,8 +207,14 @@ class MiniMindDriving(MiniMindForCausalLM):
         lidar_pointcloud: Optional[torch.FloatTensor] = None,
         radar_data: Optional[torch.FloatTensor] = None,
         gps_imu: Optional[torch.FloatTensor] = None,
+        lidar_mask: Optional[torch.BoolTensor] = None,
+        radar_mask: Optional[torch.BoolTensor] = None,
+        gps_imu_mask: Optional[torch.BoolTensor] = None,
         control_labels: Optional[torch.FloatTensor] = None,
         action_labels: Optional[torch.LongTensor] = None,
+        control_label_mask: Optional[torch.BoolTensor] = None,
+        action_label_mask: Optional[torch.BoolTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
         **kwargs,
     ):
@@ -281,12 +245,36 @@ class MiniMindDriving(MiniMindForCausalLM):
         vision_sequence = None
         if pixel_values is not None:
             vision_sequence = self._encode_images(pixel_values)
+            vision_sequence = self.sensor_fusion(
+                vision_sequence,
+                lidar_feature=lidar_pointcloud,
+                radar_feature=radar_data,
+                gps_imu_feature=gps_imu,
+                lidar_mask=lidar_mask,
+                radar_mask=radar_mask,
+                gps_imu_mask=gps_imu_mask,
+            )
 
         # ========== 3. 特征注入 ==========
         if vision_sequence is not None:
             hidden_states = self._inject_vision_features(hidden_states, vision_sequence, input_ids)
+            visual_mask = torch.ones(
+                batch_size, vision_sequence.shape[1],
+                dtype=attention_mask.dtype if attention_mask is not None else torch.long,
+                device=hidden_states.device,
+            )
+            text_mask = attention_mask if attention_mask is not None else torch.ones(
+                batch_size, text_seq_len, dtype=visual_mask.dtype,
+                device=hidden_states.device,
+            )
+            attention_mask = torch.cat([visual_mask, text_mask], dim=1)
 
         total_seq_len = hidden_states.shape[1]
+        if total_seq_len > self.model.freqs_cos.shape[0]:
+            raise ValueError(
+                f"multimodal sequence length {total_seq_len} exceeds "
+                f"max_position_embeddings={self.model.freqs_cos.shape[0]}"
+            )
 
         # ========== 4. LLM 前向 ==========
         position_embeddings = (
@@ -311,19 +299,75 @@ class MiniMindDriving(MiniMindForCausalLM):
         text_logits = self.lm_head(text_hidden)  # [B, text_seq_len, vocab_size]
 
         # ========== 6. 控制输出 ==========
-        control_outputs = None
-        if control_labels is not None or action_labels is not None:
-            # 从文本部分的最后一个 token 提取控制信号
-            control_hidden = text_hidden[:, -1, :]  # [B, hidden_size]
-            control_outputs = self.control_head(control_hidden)
+        if attention_mask is not None:
+            text_attention = attention_mask[:, -text_seq_len:]
+            last_index = text_attention.long().sum(dim=1).clamp_min(1) - 1
+            control_hidden = text_hidden[
+                torch.arange(batch_size, device=text_hidden.device), last_index
+            ]
+        else:
+            control_hidden = text_hidden[:, -1, :]
+        control_outputs = self.control_head(control_hidden)
+
+        text_loss = None
+        if labels is not None and text_logits.shape[1] > 1:
+            text_loss = F.cross_entropy(
+                text_logits[:, :-1].reshape(-1, text_logits.shape[-1]),
+                labels[:, 1:].reshape(-1),
+                ignore_index=-100,
+            )
+        control_loss = None
+        if control_labels is not None:
+            target = control_labels.to(
+                control_outputs["continuous_regression"].dtype
+            )
+            regression_loss = F.smooth_l1_loss(
+                control_outputs["continuous_regression"], target[:, :3],
+                reduction="none",
+            ).mean(dim=-1)
+            gear_loss = F.cross_entropy(
+                control_outputs["gear_logits"],
+                target[:, 3].long().clamp(0, 4),
+                reduction="none",
+            )
+            per_sample = regression_loss + gear_loss
+            mask = control_label_mask.bool() if control_label_mask is not None else (
+                torch.ones_like(per_sample, dtype=torch.bool)
+            )
+            if mask.any():
+                control_loss = per_sample[mask].mean()
+        action_loss = None
+        if action_labels is not None and "discrete_logits" in control_outputs:
+            valid_actions = action_label_mask.bool() if action_label_mask is not None else (
+                action_labels.ne(-100)
+            )
+            if valid_actions.any():
+                action_loss = F.cross_entropy(
+                    control_outputs["discrete_logits"][valid_actions],
+                    action_labels[valid_actions],
+                )
+        losses = [value for value in (text_loss,) if value is not None]
+        total_loss = sum(losses) if losses else None
+        if control_loss is not None:
+            weighted = self.config.loss_control_weight * control_loss
+            total_loss = weighted if total_loss is None else total_loss + weighted
+        if action_loss is not None:
+            weighted = self.config.loss_action_weight * action_loss
+            total_loss = weighted if total_loss is None else total_loss + weighted
 
         # ========== 7. 组装输出 ==========
         output = CausalLMOutputWithPast(
+            loss=total_loss,
             logits=text_logits,
             past_key_values=presents,
             hidden_states=hidden_states,
         )
         output.control_outputs = control_outputs
+        output.losses = {
+            "text": text_loss,
+            "control": control_loss,
+            "action": action_loss,
+        }
         return output
 
     @torch.no_grad()
@@ -385,16 +429,16 @@ class MiniMindDriving(MiniMindForCausalLM):
         else:
             text_response = generated_ids[0].tolist()
 
-        # 获取控制输出 (需要从 forward 中获取)
-        # 这里简化处理，实际需要从 model 内部获取 control_outputs
-        control_output = {
-            "steering": 0.0,
-            "throttle": 0.0,
-            "brake": 0.0,
-            "gear": 2,
-        }
-        action = "keep_lane"
-        action_probs = [0.0] * self.config.num_discrete_actions
+        decision_output = self(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask"),
+            pixel_values=pixel_values,
+        ).control_outputs
+        continuous = decision_output["continuous"][0]
+        control_output = self.control_head.decode_continuous(continuous)
+        action_index = int(decision_output["discrete_action"][0])
+        action = self.control_head.decode_discrete(action_index)
+        action_probs = decision_output["discrete_probs"][0].detach().cpu().tolist()
 
         return {
             "text_response": text_response,
