@@ -1,6 +1,8 @@
 from .driving_dataset import (
     DrivingDataCollator,
+    DrivingDPOCollator,
     DrivingDPODataset,
+    DrivingRLAIFCollator,
     DrivingRLAIFDataset,
     DrivingSFTDataset,
     DrivingSample,

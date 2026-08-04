@@ -273,6 +273,114 @@ def generate_synthetic_data(
         print(f"  {split_name}: {len(split_data)} samples -> {split_path}")
 
     print(f"Synthetic data generation complete!")
+    generate_preference_splits(output_path, data)
+
+
+def _unsafe_action(action: str, scene: str) -> str:
+    """Pick a contrasting / less-safe action for preference pairs."""
+    fallback = {
+        "keep_lane": "emergency_brake",
+        "accelerate": "emergency_brake",
+        "decelerate": "accelerate",
+        "stop": "accelerate",
+        "yield": "accelerate",
+        "turn_left": "turn_right",
+        "turn_right": "turn_left",
+        "change_lane_left": "change_lane_right",
+        "change_lane_right": "change_lane_left",
+        "overtake": "emergency_brake",
+        "park": "accelerate",
+        "emergency_brake": "accelerate",
+        "follow_lane": "emergency_brake",
+    }
+    if scene == "emergency":
+        return "accelerate"
+    return fallback.get(action, "accelerate")
+
+
+def generate_preference_splits(output_path: Path, sft_samples: List[Dict]) -> None:
+    """Emit DPO preference pairs and RLAIF reward-labeled JSONL from SFT rows."""
+    train_end = int(len(sft_samples) * 0.8)
+    val_end = train_end + int(len(sft_samples) * 0.1)
+    splits = {
+        "train": sft_samples[:train_end],
+        "val": sft_samples[train_end:val_end],
+        "test": sft_samples[val_end:],
+    }
+    for split_name, rows in splits.items():
+        dpo_rows = []
+        rlaif_rows = []
+        for item in rows:
+            action = item.get("action") or "keep_lane"
+            controls = item.get("controls") or generate_controls_for_action(action)
+            rejected_action = _unsafe_action(action, item.get("scene", "urban"))
+            rejected_controls = generate_controls_for_action(rejected_action)
+            dpo_rows.append({
+                "schema_version": "1.0",
+                "scene": item["scene"],
+                "prompt": item["prompt"],
+                "images": item["images"],
+                "timestamp": item["timestamp"],
+                "calibration": item["calibration"],
+                "ego_state": item["ego_state"],
+                "sensors": item.get("sensors") or {
+                    "lidar": [], "radar": {}, "gps_imu": None,
+                },
+                "label_source": item.get("label_source", "synthetic"),
+                "chosen": {
+                    "response": item["response"],
+                    "controls": controls,
+                    "action": action,
+                },
+                "rejected": {
+                    "response": generate_response(
+                        rejected_action, rejected_controls, item["scene"]
+                    ),
+                    "controls": rejected_controls,
+                    "action": rejected_action,
+                },
+            })
+            # Higher reward for safer / control-aligned synthetic labels.
+            safety = float(np.clip(0.55 + 0.4 * (action != "emergency_brake"), 0, 1))
+            if item.get("scene") == "emergency" and action == "emergency_brake":
+                safety = 0.95
+            if rejected_action == action:
+                safety = 0.5
+            control_quality = float(np.clip(
+                1.0 - abs(controls.get("steering", 0.0)) * 0.3
+                - max(0.0, controls.get("brake", 0.0) - 0.5) * 0.2,
+                0.2, 1.0,
+            ))
+            rlaif_rows.append({
+                "schema_version": "1.0",
+                "scene": item["scene"],
+                "prompt": item["prompt"],
+                "response": item["response"],
+                "images": item["images"],
+                "timestamp": item["timestamp"],
+                "calibration": item["calibration"],
+                "ego_state": item["ego_state"],
+                "sensors": item.get("sensors") or {
+                    "lidar": [], "radar": {}, "gps_imu": None,
+                },
+                "controls": controls,
+                "action": action,
+                "label_source": item.get("label_source", "synthetic"),
+                "safety_score": safety,
+                "control_quality": control_quality,
+                "reward": float(0.6 * safety + 0.4 * control_quality),
+            })
+
+        dpo_path = output_path / f"dpo_{split_name}.jsonl"
+        with open(dpo_path, "w", encoding="utf-8") as handle:
+            for row in dpo_rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        rlaif_path = output_path / f"rlaif_{split_name}.jsonl"
+        with open(rlaif_path, "w", encoding="utf-8") as handle:
+            for row in rlaif_rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"  dpo_{split_name}: {len(dpo_rows)} -> {dpo_path}")
+        print(f"  rlaif_{split_name}: {len(rlaif_rows)} -> {rlaif_path}")
 
 
 def generate_controls_for_action(action: str) -> Dict[str, float]:

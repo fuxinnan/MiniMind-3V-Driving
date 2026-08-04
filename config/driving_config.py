@@ -135,6 +135,22 @@ DATA_FORMAT_CONFIG: Dict[str, Any] = {
             "sensors", "action", "weather", "time_of_day", "speed",
         ],
     },
+    "dpo_fields": {
+        "required": [
+            "scene", "prompt", "images", "timestamp", "calibration",
+            "ego_state", "label_source", "chosen", "rejected",
+        ],
+        "pair_required": ["response"],
+        "pair_optional": ["controls", "action"],
+    },
+    "rlaif_fields": {
+        "required": [
+            "scene", "prompt", "response", "images", "timestamp",
+            "calibration", "ego_state", "label_source",
+            "safety_score", "control_quality",
+        ],
+        "optional": ["controls", "action", "reward", "sensors"],
+    },
     "image_format": {
         "structure": "dict_of_lists",
         "camera_names": list(CAMERA_NAMES),

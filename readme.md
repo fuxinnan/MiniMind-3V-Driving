@@ -122,24 +122,37 @@ pixi run prepare-driving-data
 pixi run validate-synthetic-data
 ```
 
-合成数据会生成可实际加载的四路图片，仅用于验证工程链路，不用于报告模型效果。
+合成数据会生成可实际加载的四路图片，仅用于验证工程链路，不用于报告模型效果。同时写出偏好数据：
+
+```text
+dpo_{train,val,test}.jsonl      chosen/rejected 文本与可选控制对
+rlaif_{train,val,test}.jsonl    safety_score / control_quality / reward
+```
+
+DPO 样本共享同一四路相机上下文；`chosen` / `rejected` 至少包含 `response`，可选 `controls` 与 `action`。RLAIF 样本在 SFT 字段上增加 `[0,1]` 的 `safety_score`、`control_quality`，缺省 `reward = 0.6·safety + 0.4·control_quality`。
 
 ## 训练
 
 ```bash
 pixi run train-driving-sft
+pixi run train-driving-dpo      # 需先有 driving_sft_{hidden}.pth
+pixi run train-driving-rlaif
 ```
 
-核心多任务目标：
+核心多任务目标（SFT）：
 
 ```text
 L = L_text + λ_control × (L_steer,pedal + L_gear) + λ_action × L_action
 ```
 
+DPO 对同一视觉上下文比较 chosen / rejected 文本序列对数似然，并冻结参考策略；可选叠加 chosen 侧控制/动作监督。RLAIF 用样本 `reward` 缩放多任务 SFT 损失。
+
 缺失控制或动作标签时，collator 使用 label mask 屏蔽相应损失。训练默认要求真实 CLIP checkpoint；只有 smoke test 可使用：
 
 ```bash
 pixi run train-driving-smoke
+pixi run train-driving-dpo-smoke
+pixi run train-driving-rlaif-smoke
 ```
 
 `--allow-random-vision` 只允许轻量 fallback，不代表有效驾驶模型。
@@ -223,6 +236,8 @@ config/                    统一驾驶配置与动作语义
 data/                      schema、dataset、nuScenes adapter、增强与校验
 model/driving/             时序、多相机、传感器融合和多任务输出
 trainer/train_driving_sft.py
+trainer/train_driving_dpo.py
+trainer/train_driving_rlaif.py
 evaluate/                  控制、动作、安全与场景评估
 serve/inference_engine.py  单次多模态前向
 serve/driving_api_server.py

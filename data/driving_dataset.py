@@ -193,6 +193,75 @@ class _ImageLoader:
             camera_masks.append(torch.tensor(mask, dtype=torch.bool))
         return torch.stack(loaded_cameras), torch.stack(camera_masks)
 
+    def _load_sensors(self, sensors: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
+        lidar, lidar_mask = self._load_point_sensor(
+            sensors.get("lidar"), self.config.lidar_num_points,
+            self.config.lidar_point_dims, "lidar",
+        )
+        radar_value = sensors.get("radar")
+        radar_refs = []
+        if isinstance(radar_value, dict):
+            for refs in radar_value.values():
+                radar_refs.extend(refs or [])
+        else:
+            radar_refs = radar_value or []
+        radar, radar_mask = self._load_point_sensor(
+            radar_refs, self.config.radar_num_detections,
+            self.config.radar_point_dims, "radar",
+        )
+        gps_value = sensors.get("gps_imu")
+        gps = torch.zeros(self.config.gps_imu_dims, dtype=torch.float32)
+        gps_mask = torch.tensor(False)
+        if isinstance(gps_value, dict):
+            gps_value = gps_value.get("values")
+        if gps_value is not None:
+            values = torch.as_tensor(gps_value, dtype=torch.float32).flatten()
+            count = min(values.numel(), gps.numel())
+            gps[:count] = values[:count]
+            gps_mask = torch.tensor(count == gps.numel())
+        return {
+            "lidar_pointcloud": lidar,
+            "lidar_mask": lidar_mask,
+            "radar_data": radar,
+            "radar_mask": radar_mask,
+            "gps_imu": gps,
+            "gps_imu_mask": gps_mask,
+        }
+
+    def _load_point_sensor(
+        self, references: Any, max_points: int, dimensions: int, kind: str
+    ) -> Tuple[torch.Tensor, torch.BoolTensor]:
+        output = torch.zeros(max_points, dimensions, dtype=torch.float32)
+        mask = torch.zeros(max_points, dtype=torch.bool)
+        refs = references if isinstance(references, list) else []
+        chunks: List[np.ndarray] = []
+        for reference in refs:
+            reference = reference.get("path") if isinstance(reference, dict) else reference
+            if not reference:
+                continue
+            path = Path(reference)
+            if not path.is_absolute():
+                path = self.image_root / path
+            try:
+                if path.suffix == ".npy":
+                    array = np.load(path)
+                elif path.suffix == ".pcd" and kind == "radar":
+                    from nuscenes.utils.data_classes import RadarPointCloud
+                    array = RadarPointCloud.from_file(str(path)).points.T
+                else:
+                    array = np.fromfile(path, dtype=np.float32)
+                    array = array.reshape(-1, dimensions)
+                chunks.append(np.asarray(array, dtype=np.float32))
+            except (OSError, ValueError, ImportError):
+                continue
+        if chunks:
+            values = np.concatenate(chunks, axis=0)
+            count = min(len(values), max_points)
+            width = min(values.shape[1], dimensions)
+            output[:count, :width] = torch.from_numpy(values[:count, :width])
+            mask[:count] = True
+        return output, mask
+
 
 class DrivingSFTDataset(_ImageLoader, Dataset):
     """Validated SFT dataset returning images shaped ``[4,T,3,H,W]``."""
@@ -291,75 +360,6 @@ class DrivingSFTDataset(_ImageLoader, Dataset):
             },
         }
 
-    def _load_sensors(self, sensors: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
-        lidar, lidar_mask = self._load_point_sensor(
-            sensors.get("lidar"), self.config.lidar_num_points,
-            self.config.lidar_point_dims, "lidar",
-        )
-        radar_value = sensors.get("radar")
-        radar_refs = []
-        if isinstance(radar_value, dict):
-            for refs in radar_value.values():
-                radar_refs.extend(refs or [])
-        else:
-            radar_refs = radar_value or []
-        radar, radar_mask = self._load_point_sensor(
-            radar_refs, self.config.radar_num_detections,
-            self.config.radar_point_dims, "radar",
-        )
-        gps_value = sensors.get("gps_imu")
-        gps = torch.zeros(self.config.gps_imu_dims, dtype=torch.float32)
-        gps_mask = torch.tensor(False)
-        if isinstance(gps_value, dict):
-            gps_value = gps_value.get("values")
-        if gps_value is not None:
-            values = torch.as_tensor(gps_value, dtype=torch.float32).flatten()
-            count = min(values.numel(), gps.numel())
-            gps[:count] = values[:count]
-            gps_mask = torch.tensor(count == gps.numel())
-        return {
-            "lidar_pointcloud": lidar,
-            "lidar_mask": lidar_mask,
-            "radar_data": radar,
-            "radar_mask": radar_mask,
-            "gps_imu": gps,
-            "gps_imu_mask": gps_mask,
-        }
-
-    def _load_point_sensor(
-        self, references: Any, max_points: int, dimensions: int, kind: str
-    ) -> Tuple[torch.Tensor, torch.BoolTensor]:
-        output = torch.zeros(max_points, dimensions, dtype=torch.float32)
-        mask = torch.zeros(max_points, dtype=torch.bool)
-        refs = references if isinstance(references, list) else []
-        chunks: List[np.ndarray] = []
-        for reference in refs:
-            reference = reference.get("path") if isinstance(reference, dict) else reference
-            if not reference:
-                continue
-            path = Path(reference)
-            if not path.is_absolute():
-                path = self.image_root / path
-            try:
-                if path.suffix == ".npy":
-                    array = np.load(path)
-                elif path.suffix == ".pcd" and kind == "radar":
-                    from nuscenes.utils.data_classes import RadarPointCloud
-                    array = RadarPointCloud.from_file(str(path)).points.T
-                else:
-                    array = np.fromfile(path, dtype=np.float32)
-                    array = array.reshape(-1, dimensions)
-                chunks.append(np.asarray(array, dtype=np.float32))
-            except (OSError, ValueError, ImportError):
-                continue
-        if chunks:
-            values = np.concatenate(chunks, axis=0)
-            count = min(len(values), max_points)
-            width = min(values.shape[1], dimensions)
-            output[:count, :width] = torch.from_numpy(values[:count, :width])
-            mask[:count] = True
-        return output, mask
-
 
 class DrivingDataCollator:
     """Pad text and preserve missing labels through explicit masks."""
@@ -411,93 +411,335 @@ def driving_collate_fn(features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     return DrivingDataCollator()(features)
 
 
-class _PreferenceImageDataset(_ImageLoader, Dataset):
-    def _common_init(
-        self, data_path, config, image_root, tokenizer, max_seq_len, num_frames
+def _parse_control_tensor(controls: Optional[Mapping[str, Any]]) -> Optional[torch.Tensor]:
+    if controls is None:
+        return None
+    missing = [key for key in CONTINUOUS_CONTROL_KEYS if key not in controls]
+    if missing:
+        raise ValueError(f"controls missing {missing}")
+    return torch.tensor(
+        [float(controls[key]) for key in CONTINUOUS_CONTROL_KEYS],
+        dtype=torch.float32,
+    )
+
+
+def _parse_action_tensor(action: Optional[str]) -> Optional[torch.Tensor]:
+    if action is None:
+        return None
+    if action not in ACTION_TO_ID:
+        raise ValueError(f"unknown action: {action}")
+    return torch.tensor(ACTION_TO_ID[action], dtype=torch.long)
+
+
+def _validate_camera_bundle(item: Mapping[str, Any], index: int) -> None:
+    required = [
+        "scene", "prompt", "images", "timestamp", "calibration",
+        "ego_state", "label_source",
+    ]
+    missing = [key for key in required if key not in item]
+    if missing:
+        raise ValueError(f"sample {index} missing fields: {missing}")
+    images = item["images"]
+    absent = [name for name in CAMERA_NAMES if name not in images]
+    if absent:
+        raise ValueError(f"sample {index} missing cameras: {absent}")
+    for camera in CAMERA_NAMES:
+        if not isinstance(images[camera], list) or not images[camera]:
+            raise ValueError(f"sample {index} images.{camera} must be non-empty")
+
+
+class DrivingDPODataset(_ImageLoader, Dataset):
+    """Preference pairs for driving DPO with shared multi-camera context."""
+
+    def __init__(
+        self,
+        data_path: str,
+        config: Optional[DrivingConfig] = None,
+        image_root: str = "./dataset/driving/raw/camera",
+        tokenizer=None,
+        max_seq_len: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        transform=None,
+        strict_images: bool = True,
+        validate_schema: bool = True,
     ):
         self.config = config or DrivingConfig()
         self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
-        self.data = load_driving_records(data_path)
+        self.max_seq_len = max_seq_len or self.config.max_seq_len
         self._init_image_loader(
-            self.config, image_root, num_frames, None, strict_images=False
+            self.config, image_root, num_frames, transform, strict_images
         )
+        self.data = load_driving_records(data_path)
+        if validate_schema:
+            for index, item in enumerate(self.data):
+                self._validate_item(item, index)
 
-    def __len__(self):
+    @staticmethod
+    def _validate_item(item: Mapping[str, Any], index: int) -> None:
+        _validate_camera_bundle(item, index)
+        for side in ("chosen", "rejected"):
+            pair = item.get(side)
+            if not isinstance(pair, dict) or "response" not in pair:
+                raise ValueError(f"sample {index}.{side} requires response")
+            if pair.get("action") is not None and pair["action"] not in ACTION_TO_ID:
+                raise ValueError(f"sample {index}.{side}.action unknown")
+            if pair.get("controls") is not None:
+                _parse_control_tensor(pair["controls"])
+
+    def __len__(self) -> int:
         return len(self.data)
 
-    def _conversation(self, messages):
+    def _tokenize(self, prompt: str, response: str) -> Dict[str, torch.Tensor]:
         if self.tokenizer is None:
             return {
-                "input_ids": torch.tensor([1]),
-                "attention_mask": torch.tensor([1]),
+                "input_ids": torch.tensor([1], dtype=torch.long),
+                "attention_mask": torch.tensor([1], dtype=torch.long),
             }
+        messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": response},
+        ]
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
-        values = self.tokenizer(
+        encoded = self.tokenizer(
             text, truncation=True, max_length=self.max_seq_len,
             return_tensors="pt",
         )
-        return {key: value.squeeze(0) for key, value in values.items()}
+        return {key: value.squeeze(0) for key, value in encoded.items()}
 
-
-class DrivingDPODataset(_PreferenceImageDataset):
-    """Legacy-compatible preference dataset using the shared image loader."""
-
-    def __init__(
-        self, data_path, config=None,
-        image_root="./dataset/driving/raw/camera", tokenizer=None,
-        max_seq_len=2048, num_frames=3,
-    ):
-        self._common_init(
-            data_path, config, image_root, tokenizer, max_seq_len, num_frames
-        )
-
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Dict[str, Any]:
         item = self.data[index]
-        chosen = self._conversation([
-            {"role": "user", "content": item.get("prompt", "")},
-            {"role": "assistant", "content": item["chosen"]["response"]},
-        ])
-        rejected = self._conversation([
-            {"role": "user", "content": item.get("prompt", "")},
-            {"role": "assistant", "content": item["rejected"]["response"]},
-        ])
-        pixels, _ = self._load_images(item)
+        prompt = item.get("prompt", "")
+        chosen = item["chosen"]
+        rejected = item["rejected"]
+        chosen_text = self._tokenize(prompt, chosen["response"])
+        rejected_text = self._tokenize(prompt, rejected["response"])
+        pixels, image_mask = self._load_images(item)
+        sensors = self._load_sensors(item.get("sensors") or {})
+        chosen_controls = _parse_control_tensor(chosen.get("controls"))
+        rejected_controls = _parse_control_tensor(rejected.get("controls"))
+        chosen_action = _parse_action_tensor(chosen.get("action"))
+        rejected_action = _parse_action_tensor(rejected.get("action"))
         return {
-            "chosen_input_ids": chosen["input_ids"],
-            "chosen_attention_mask": chosen["attention_mask"],
-            "rejected_input_ids": rejected["input_ids"],
-            "rejected_attention_mask": rejected["attention_mask"],
+            "chosen_input_ids": chosen_text["input_ids"],
+            "chosen_attention_mask": chosen_text["attention_mask"],
+            "rejected_input_ids": rejected_text["input_ids"],
+            "rejected_attention_mask": rejected_text["attention_mask"],
             "pixel_values": pixels,
+            "image_mask": image_mask,
+            **sensors,
+            "chosen_control_labels": chosen_controls,
+            "chosen_control_mask": torch.tensor(
+                chosen_controls is not None, dtype=torch.bool
+            ),
+            "rejected_control_labels": rejected_controls,
+            "rejected_control_mask": torch.tensor(
+                rejected_controls is not None, dtype=torch.bool
+            ),
+            "chosen_action_labels": chosen_action,
+            "chosen_action_mask": torch.tensor(
+                chosen_action is not None, dtype=torch.bool
+            ),
+            "rejected_action_labels": rejected_action,
+            "rejected_action_mask": torch.tensor(
+                rejected_action is not None, dtype=torch.bool
+            ),
             "scene": item.get("scene", "unknown"),
+            "metadata": {
+                "timestamp": item.get("timestamp"),
+                "label_source": item.get("label_source"),
+                **(item.get("metadata") or {}),
+            },
         }
 
 
-class DrivingRLAIFDataset(_PreferenceImageDataset):
-    """Legacy-compatible AI-feedback dataset."""
+class DrivingDPOCollator:
+    """Pad chosen/rejected text while stacking shared camera tensors."""
+
+    def __init__(self, pad_token_id: int = 0):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        batch: Dict[str, Any] = {
+            "chosen_input_ids": pad_sequence(
+                [item["chosen_input_ids"] for item in features],
+                batch_first=True, padding_value=self.pad_token_id,
+            ),
+            "chosen_attention_mask": pad_sequence(
+                [item["chosen_attention_mask"] for item in features],
+                batch_first=True, padding_value=0,
+            ),
+            "rejected_input_ids": pad_sequence(
+                [item["rejected_input_ids"] for item in features],
+                batch_first=True, padding_value=self.pad_token_id,
+            ),
+            "rejected_attention_mask": pad_sequence(
+                [item["rejected_attention_mask"] for item in features],
+                batch_first=True, padding_value=0,
+            ),
+        }
+        stack_keys = [
+            "pixel_values", "image_mask", "lidar_pointcloud", "lidar_mask",
+            "radar_data", "radar_mask", "gps_imu", "gps_imu_mask",
+            "chosen_control_mask", "rejected_control_mask",
+            "chosen_action_mask", "rejected_action_mask",
+        ]
+        for key in stack_keys:
+            batch[key] = torch.stack([item[key] for item in features])
+
+        def optional_stack(value_key, mask_key, fill):
+            mask = batch[mask_key]
+            if not bool(mask.any()):
+                return None
+            return torch.stack([
+                item[value_key] if item[value_key] is not None else fill
+                for item in features
+            ])
+
+        batch["chosen_control_labels"] = optional_stack(
+            "chosen_control_labels", "chosen_control_mask", torch.zeros(4)
+        )
+        batch["rejected_control_labels"] = optional_stack(
+            "rejected_control_labels", "rejected_control_mask", torch.zeros(4)
+        )
+        batch["chosen_action_labels"] = optional_stack(
+            "chosen_action_labels", "chosen_action_mask",
+            torch.tensor(-100, dtype=torch.long),
+        )
+        batch["rejected_action_labels"] = optional_stack(
+            "rejected_action_labels", "rejected_action_mask",
+            torch.tensor(-100, dtype=torch.long),
+        )
+        batch["scene"] = [item["scene"] for item in features]
+        batch["metadata"] = [item["metadata"] for item in features]
+        return batch
+
+
+class DrivingRLAIFDataset(_ImageLoader, Dataset):
+    """Reward-labeled driving samples for RLAIF / reward-weighted SFT."""
 
     def __init__(
-        self, data_path, config=None,
-        image_root="./dataset/driving/raw/camera", tokenizer=None,
-        max_seq_len=2048, num_frames=3,
+        self,
+        data_path: str,
+        config: Optional[DrivingConfig] = None,
+        image_root: str = "./dataset/driving/raw/camera",
+        tokenizer=None,
+        max_seq_len: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        transform=None,
+        strict_images: bool = True,
+        validate_schema: bool = True,
+        safety_weight: float = 0.6,
+        control_weight: float = 0.4,
     ):
-        self._common_init(
-            data_path, config, image_root, tokenizer, max_seq_len, num_frames
+        self.config = config or DrivingConfig()
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len or self.config.max_seq_len
+        self.safety_weight = safety_weight
+        self.control_weight = control_weight
+        self._init_image_loader(
+            self.config, image_root, num_frames, transform, strict_images
         )
+        self.data = load_driving_records(data_path)
+        if validate_schema:
+            for index, item in enumerate(self.data):
+                self._validate_item(item, index)
 
-    def __getitem__(self, index):
+    @staticmethod
+    def _validate_item(item: Mapping[str, Any], index: int) -> None:
+        _validate_camera_bundle(item, index)
+        if "response" not in item and "conversations" not in item:
+            raise ValueError(f"sample {index} needs response or conversations")
+        for key in ("safety_score", "control_quality"):
+            if key not in item:
+                raise ValueError(f"sample {index} missing {key}")
+            value = float(item[key])
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"sample {index}.{key} must be in [0, 1]")
+        if item.get("action") is not None and item["action"] not in ACTION_TO_ID:
+            raise ValueError(f"sample {index}.action unknown")
+        if item.get("controls") is not None:
+            _parse_control_tensor(item["controls"])
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def _tokenize_item(self, item: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
+        if self.tokenizer is None:
+            return {
+                "input_ids": torch.tensor([1], dtype=torch.long),
+                "attention_mask": torch.tensor([1], dtype=torch.long),
+            }
+        if item.get("conversations"):
+            messages = item["conversations"]
+        else:
+            messages = [
+                {"role": "user", "content": item.get("prompt", "")},
+                {"role": "assistant", "content": item.get("response", "")},
+            ]
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        encoded = self.tokenizer(
+            text, truncation=True, max_length=self.max_seq_len,
+            return_tensors="pt",
+        )
+        return {key: value.squeeze(0) for key, value in encoded.items()}
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
         item = self.data[index]
-        values = self._conversation(item.get("conversations", []))
-        pixels, _ = self._load_images(item)
+        text = self._tokenize_item(item)
+        pixels, image_mask = self._load_images(item)
+        sensors = self._load_sensors(item.get("sensors") or {})
+        control_labels = _parse_control_tensor(item.get("controls"))
+        action_labels = _parse_action_tensor(item.get("action"))
+        safety = float(item["safety_score"])
+        control_quality = float(item["control_quality"])
+        reward = item.get("reward")
+        if reward is None:
+            reward = (
+                self.safety_weight * safety + self.control_weight * control_quality
+            )
+        reward = float(np.clip(reward, 0.0, 1.0))
         return {
-            **values,
+            **text,
             "pixel_values": pixels,
+            "image_mask": image_mask,
+            **sensors,
+            "control_labels": control_labels,
+            "control_label_mask": torch.tensor(
+                control_labels is not None, dtype=torch.bool
+            ),
+            "action_labels": action_labels,
+            "action_label_mask": torch.tensor(
+                action_labels is not None, dtype=torch.bool
+            ),
+            "safety_score": torch.tensor(safety, dtype=torch.float32),
+            "control_quality": torch.tensor(control_quality, dtype=torch.float32),
+            "reward": torch.tensor(reward, dtype=torch.float32),
             "scene": item.get("scene", "unknown"),
-            "safety_score": item.get("safety_score", 0.0),
-            "control_quality": item.get("control_quality", 0.0),
+            "metadata": {
+                "timestamp": item.get("timestamp"),
+                "label_source": item.get("label_source"),
+                **(item.get("metadata") or {}),
+            },
         }
+
+
+class DrivingRLAIFCollator(DrivingDataCollator):
+    """Reuse SFT stacking and append scalar reward fields."""
+
+    def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        batch = super().__call__(features)
+        batch["safety_score"] = torch.stack(
+            [item["safety_score"] for item in features]
+        )
+        batch["control_quality"] = torch.stack(
+            [item["control_quality"] for item in features]
+        )
+        batch["reward"] = torch.stack([item["reward"] for item in features])
+        return batch
 
 
 class NuScenesDataset(DrivingSFTDataset):
